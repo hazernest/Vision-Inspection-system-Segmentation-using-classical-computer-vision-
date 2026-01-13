@@ -35,12 +35,17 @@ class ImageWidget(QtWidgets.QWidget):
         # selected cell index and mask pixmap (in image coordinates)
         self.selected_cell_index = None
         self.selected_mask_pixmap = None
-        # optional QPainterPath outlining eroded mask (in display coordinates)
+        # optional QPainterPath outlining eroded mask (in image coordinates)
         self.erosion_path = None
         # per-cell overlays to draw on the main canvas: {grid_idx: {'seg': QPixmap|None, 'defect': QPixmap|None}}
         self.cell_overlays = {}
         # current overlay mode for full-canvas drawing
         self.overlay_mode = 'Defect'
+
+        # inspection mode: show only X/O verdicts per unit (no overlays)
+        self.inspection_mode = False
+        # {grid_idx: bool} where True means defect (X), False means OK (O)
+        self.inspection_results = {}
 
     def load_image(self, path):
         img = QtGui.QImage(path)
@@ -104,6 +109,40 @@ class ImageWidget(QtWidgets.QWidget):
             painter.drawRect(dr)
             painter.drawText(dr.topLeft() + QtCore.QPoint(3, 12), str(idx))
 
+        # inspection view: draw only verdict markers and skip overlays
+        if getattr(self, 'inspection_mode', False):
+            painter.save()
+            painter.setOpacity(1.0)
+            font = painter.font()
+            font.setBold(True)
+            painter.setFont(font)
+            for r, idx in self.grid_rects:
+                img_r = QtCore.QRect(int(r[0]), int(r[1]), int(r[2]), int(r[3]))
+                dr = self.imgrect_to_display(img_r)
+                verdict = None
+                try:
+                    verdict = self.inspection_results.get(idx)
+                except Exception:
+                    verdict = None
+                if verdict is None:
+                    continue
+                # size text relative to cell size
+                try:
+                    s = max(10.0, min(dr.width(), dr.height()) * 0.45)
+                except Exception:
+                    s = 18.0
+                f = painter.font()
+                f.setPointSizeF(float(s))
+                painter.setFont(f)
+                if verdict:
+                    painter.setPen(QtGui.QPen(QtGui.QColor(255, 0, 0), 3))
+                    painter.drawText(dr, QtCore.Qt.AlignCenter, 'X')
+                else:
+                    painter.setPen(QtGui.QPen(QtGui.QColor(0, 255, 0), 3))
+                    painter.drawText(dr, QtCore.Qt.AlignCenter, 'O')
+            painter.restore()
+            return
+
         # draw overlays for ALL units on the main canvas
         mode = getattr(self, 'overlay_mode', 'Defect')
         if mode != 'None' and getattr(self, 'cell_overlays', None):
@@ -136,13 +175,17 @@ class ImageWidget(QtWidgets.QWidget):
                     painter.drawPixmap(dr.topLeft(), mask_scaled)
                     painter.setOpacity(1.0)
                     break
-                # draw erosion outline if present
-                if self.erosion_path is not None:
-                    pen = QtGui.QPen(QtGui.QColor(0, 255, 255), 2)
-                    pen.setStyle(QtCore.Qt.SolidLine)
-                    painter.setPen(pen)
-                    painter.setBrush(QtCore.Qt.NoBrush)
-                    painter.drawPath(self.erosion_path)
+
+        # draw erosion outline if present (in image coordinates, scaled to display)
+        if self.erosion_path is not None:
+            painter.save()
+            pen = QtGui.QPen(QtGui.QColor(0, 255, 255), 2)
+            pen.setCosmetic(True)
+            painter.setPen(pen)
+            painter.setBrush(QtCore.Qt.NoBrush)
+            painter.setWorldTransform(QtGui.QTransform().scale(self.scale, self.scale), False)
+            painter.drawPath(self.erosion_path)
+            painter.restore()
     def mousePressEvent(self, event):
         if not self.image:
             return
@@ -416,9 +459,17 @@ class MainWindow(QtWidgets.QMainWindow):
         self.overlay_mode.setCurrentIndex(2)
         pv.addWidget(self.overlay_mode)
         self.overlay_mode.currentIndexChanged.connect(self.on_overlay_mode_changed)
+
+        # Live update (debounced) for defect parameters
+        self._defect_autoupdate_timer = QtCore.QTimer(self)
+        self._defect_autoupdate_timer.setSingleShot(True)
+        self._defect_autoupdate_timer.timeout.connect(self._auto_update_defect_selected_unit)
+        self.defect_threshold.valueChanged.connect(self.schedule_defect_autoupdate)
+        self.defect_min_area.valueChanged.connect(self.schedule_defect_autoupdate)
         # recompute erosion outline when mask-erode value changes
         if hasattr(self, 'defect_mask_erode'):
             self.defect_mask_erode.valueChanged.connect(lambda _: self.update_erosion_outline(self.img_widget.selected_cell_index))
+            self.defect_mask_erode.valueChanged.connect(self.schedule_defect_autoupdate)
         # unit index selector for testing
         self.defect_unit_spin = QtWidgets.QSpinBox(); self.defect_unit_spin.setRange(0, 0); self.defect_unit_spin.setValue(0)
         pv.addWidget(QtWidgets.QLabel('Unit index to test:'))
@@ -430,6 +481,15 @@ class MainWindow(QtWidgets.QMainWindow):
         test_all_btn = QtWidgets.QPushButton('Test All Units')
         test_all_btn.clicked.connect(self.test_defect_detection_all)
         pv.addWidget(test_all_btn)
+
+        self.run_insp_btn = QtWidgets.QPushButton('Run Inspection')
+        self.run_insp_btn.setCheckable(True)
+        # Turn green when enabled
+        self.run_insp_btn.setStyleSheet(
+            "QPushButton:checked { background-color: rgb(0, 180, 0); color: white; }"
+        )
+        self.run_insp_btn.toggled.connect(self.on_inspection_toggled)
+        pv.addWidget(self.run_insp_btn)
         pv.addStretch(1)
         defect_subtabs.addTab(particle_tab, 'Foreign material')
 
@@ -489,11 +549,88 @@ class MainWindow(QtWidgets.QMainWindow):
             # keep apply enabled so user can re-lock by clicking Apply
             self.apply_btn.setEnabled(True)
 
+    def schedule_defect_autoupdate(self, *_):
+        # Debounce rapid UI changes (spinbox arrows / mouse wheel)
+        # Any parameter change exits inspection mode back to overlays.
+        try:
+            if getattr(self.img_widget, 'inspection_mode', False):
+                # also untoggle the button if present
+                if hasattr(self, 'run_insp_btn') and self.run_insp_btn is not None:
+                    with QtCore.QSignalBlocker(self.run_insp_btn):
+                        self.run_insp_btn.setChecked(False)
+                self.exit_inspection_mode(force_overlay_mode='Both')
+        except Exception:
+            pass
+        try:
+            if hasattr(self, '_defect_autoupdate_timer') and self._defect_autoupdate_timer is not None:
+                self._defect_autoupdate_timer.start(250)
+        except Exception:
+            pass
+
+    def _auto_update_defect_selected_unit(self):
+        # Recompute defect mask for the currently selected unit, silently.
+        row = self.thumb_list.currentRow()
+        if row < 0 or row >= self.thumb_list.count():
+            return
+        item = self.thumb_list.item(row)
+        pix = item.data(QtCore.Qt.UserRole)
+        seg_mask_pm = item.data(QtCore.Qt.UserRole + 1)
+        if not isinstance(pix, QtGui.QPixmap) or not isinstance(seg_mask_pm, QtGui.QPixmap):
+            return
+        pm_mask = self._detect_defects_on_pix(pix, seg_mask_pm, verbose=False)
+        item.setData(QtCore.Qt.UserRole + 2, pm_mask if isinstance(pm_mask, QtGui.QPixmap) else None)
+        # refresh overlays to reflect the new mask values
+        if self.img_widget.selected_cell_index == row:
+            self.update_selected_overlay(row)
+        self.refresh_thumbnail_icons()
+        self.refresh_canvas_overlays()
+
+    def exit_inspection_mode(self, force_overlay_mode: str = 'Both'):
+        # Leave inspection mode and restore overlay rendering.
+        try:
+            if getattr(self.img_widget, 'inspection_mode', False):
+                self.img_widget.inspection_mode = False
+                self.img_widget.inspection_results = {}
+        except Exception:
+            pass
+        # restore overlays
+        try:
+            if hasattr(self, 'overlay_mode') and self.overlay_mode is not None and force_overlay_mode:
+                with QtCore.QSignalBlocker(self.overlay_mode):
+                    self.overlay_mode.setCurrentText(str(force_overlay_mode))
+        except Exception:
+            pass
+        self.update_selected_overlay(self.img_widget.selected_cell_index)
+        self.refresh_thumbnail_icons()
+        self.refresh_canvas_overlays()
+        self.img_widget.update()
+
+    def on_inspection_toggled(self, checked: bool):
+        # Toggle inspection mode: ON => compute + show X/O, OFF => show overlays.
+        if checked:
+            ok = self.run_inspection()
+            if not ok:
+                # reset toggle if inspection could not run
+                try:
+                    with QtCore.QSignalBlocker(self.run_insp_btn):
+                        self.run_insp_btn.setChecked(False)
+                except Exception:
+                    pass
+        else:
+            self.exit_inspection_mode(force_overlay_mode='Both')
+
     def on_cell_clicked(self, idx):
         # select thumbnail and show mask overlay for this cell
         if idx < self.thumb_list.count():
             self.thumb_list.setCurrentRow(idx)
             self.img_widget.selected_cell_index = idx
+            # keep the defect "Unit index to test" in sync with click selection
+            try:
+                if hasattr(self, 'defect_unit_spin') and self.defect_unit_spin is not None:
+                    if 0 <= idx <= self.defect_unit_spin.maximum():
+                        self.defect_unit_spin.setValue(int(idx))
+            except Exception:
+                pass
             self.update_selected_overlay(idx)
             self.img_widget.update()
 
@@ -505,6 +642,13 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         item = self.thumb_list.item(row)
         self.img_widget.selected_cell_index = row
+        # keep the defect "Unit index to test" in sync with list selection
+        try:
+            if hasattr(self, 'defect_unit_spin') and self.defect_unit_spin is not None:
+                if 0 <= row <= self.defect_unit_spin.maximum():
+                    self.defect_unit_spin.setValue(int(row))
+        except Exception:
+            pass
         self.update_selected_overlay(row)
 
         # center and zoom to selected cell and move zoom buttons near it
@@ -512,8 +656,18 @@ class MainWindow(QtWidgets.QMainWindow):
             self.center_on_cell(row)
 
     def test_defect_detection(self):
-        # run defect detection on the unit specified by `defect_unit_spin`
-        row = int(self.defect_unit_spin.value()) if hasattr(self, 'defect_unit_spin') else self.thumb_list.currentRow()
+        # run defect detection on the currently selected unit (click a unit, then press Test)
+        try:
+            if getattr(self.img_widget, 'inspection_mode', False):
+                if hasattr(self, 'run_insp_btn') and self.run_insp_btn is not None:
+                    with QtCore.QSignalBlocker(self.run_insp_btn):
+                        self.run_insp_btn.setChecked(False)
+                self.exit_inspection_mode(force_overlay_mode='Both')
+        except Exception:
+            pass
+        row = self.thumb_list.currentRow()
+        if row < 0 and hasattr(self, 'defect_unit_spin'):
+            row = int(self.defect_unit_spin.value())
         if row < 0 or row >= self.thumb_list.count():
             QtWidgets.QMessageBox.information(self, 'Info', 'Select a valid unit index first.')
             return
@@ -561,8 +715,11 @@ class MainWindow(QtWidgets.QMainWindow):
         verdict = 'NG' if area >= int(self.defect_min_area.value()) else 'OK'
         self.log(f'Unit {row}: defect area={area} px -> {verdict}')
 
-    def _detect_defects_on_pix(self, pix: QtGui.QPixmap, seg_mask_pix: QtGui.QPixmap = None):
+    def _detect_defects_on_pix(self, pix: QtGui.QPixmap, seg_mask_pix: QtGui.QPixmap = None, verbose: bool = True):
         # returns a QPixmap mask (grayscale) highlighting defects, or None
+        def _dlog(msg: str):
+            if verbose:
+                self.log(msg)
         qimg = pix.toImage()
         gray = segmentation.qimage_to_gray_array(qimg)
         seg_bin = None
@@ -577,7 +734,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 seg_area0 = int((seg_bin > 0).sum())
             except Exception:
                 seg_area0 = 0
-            self.log(f'Seg mask area (roi)={seg_area0}, erode_px={erode_px}')
+            _dlog(f'Seg mask area (roi)={seg_area0}, erode_px={erode_px}')
             if erode_px > 0:
                 try:
                     seg_bin = cv2.erode(seg_bin, None, iterations=erode_px)
@@ -585,7 +742,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     pass
             # if segmentation mask is empty after normalization/erosion, skip detection
             if seg_bin is None or seg_bin.sum() == 0:
-                self.log(f'Segmentation mask empty after erode — skipping detection for this unit')
+                _dlog('Segmentation mask empty after erode — skipping detection for this unit')
                 return None
         method = str(self.defect_method.currentText())
         thr = int(self.defect_threshold.value())
@@ -605,7 +762,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)), iterations=1)
             except Exception:
                 pass
-            self.log(f'Residual mask area={int((mask > 0).sum())}')
+            _dlog(f'Residual mask area={int((mask > 0).sum())}')
         else:
             mask = cv2.Canny(gray, max(1, thr//2), max(2, thr))
             if seg_bin is not None:
@@ -619,7 +776,7 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception:
             seg_area = int(gray.shape[0] * gray.shape[1])
         max_area = max(min_area, int(seg_area * 0.98))
-        self.log(f'Defect area filter: min={min_area}, max={max_area}, seg_area={seg_area}')
+        _dlog(f'Defect area filter: min={min_area}, max={max_area}, seg_area={seg_area}')
         found = False
         for c in cnts:
             a = cv2.contourArea(c)
@@ -628,7 +785,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 found = True
             else:
                 if a >= min_area:
-                    self.log(f'Skipping large contour area={int(a)} (>max={max_area})')
+                    _dlog(f'Skipping large contour area={int(a)} (>max={max_area})')
         if not found:
             return None
         h_m, w_m = mask2.shape
@@ -639,6 +796,14 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def test_defect_detection_all(self):
         # run defect detection on all thumbnails and update thumbnails/icons
+        try:
+            if getattr(self.img_widget, 'inspection_mode', False):
+                if hasattr(self, 'run_insp_btn') and self.run_insp_btn is not None:
+                    with QtCore.QSignalBlocker(self.run_insp_btn):
+                        self.run_insp_btn.setChecked(False)
+                self.exit_inspection_mode(force_overlay_mode='Both')
+        except Exception:
+            pass
         count = self.thumb_list.count()
         if count == 0:
             QtWidgets.QMessageBox.information(self, 'Info', 'No units available.')
@@ -688,6 +853,60 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.img_widget.selected_cell_index is not None:
             self.update_selected_overlay(self.img_widget.selected_cell_index)
             # Do not auto-zoom/center after batch runs; keep user's current view.
+
+    def run_inspection(self) -> bool:
+        # Run defect detection across all units and show only X/O verdict markers (no overlays)
+        count = self.thumb_list.count()
+        if count == 0:
+            QtWidgets.QMessageBox.information(self, 'Info', 'No units available.')
+            return False
+        self.statusBar().showMessage('Running inspection on all units...')
+
+        results = {}
+        ng_count = 0
+        min_area = int(self.defect_min_area.value()) if hasattr(self, 'defect_min_area') else 0
+
+        for row in range(count):
+            item = self.thumb_list.item(row)
+            try:
+                grid_idx = int(item.text())
+            except Exception:
+                grid_idx = row
+
+            pix = item.data(QtCore.Qt.UserRole)
+            seg_mask_pm = item.data(QtCore.Qt.UserRole + 1)
+            if not isinstance(pix, QtGui.QPixmap) or not isinstance(seg_mask_pm, QtGui.QPixmap):
+                # no data => leave as unknown (no marker)
+                continue
+
+            pm_mask = self._detect_defects_on_pix(pix, seg_mask_pm, verbose=False)
+            # store defect mask so returning to overlay view is instant
+            item.setData(QtCore.Qt.UserRole + 2, pm_mask if isinstance(pm_mask, QtGui.QPixmap) else None)
+
+            if pm_mask is None:
+                results[grid_idx] = False
+                continue
+
+            # compute area and verdict like the existing "Test" flow
+            try:
+                qim = pm_mask.toImage()
+                arr = segmentation.qimage_to_gray_array(qim)
+                stats = segmentation.mask_stats(arr)
+                area = int(stats.get('area', 0))
+            except Exception:
+                area = 0
+
+            is_ng = area >= min_area
+            results[grid_idx] = bool(is_ng)
+            if is_ng:
+                ng_count += 1
+
+        # switch to inspection mode: hide overlays and show X/O
+        self.img_widget.inspection_results = results
+        self.img_widget.inspection_mode = True
+        self.img_widget.update()
+        self.statusBar().showMessage(f'Inspection complete: {ng_count}/{count} units NG', 4000)
+        return True
 
     def center_on_cell(self, row: int):
         # Ensure the cell at `row` is visible and centered with an appropriate zoom.
@@ -900,6 +1119,13 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def on_overlay_mode_changed(self, *_):
         # update selected overlay and all thumbnail icons
+        # If the user picks an overlay mode, leave inspection mode.
+        try:
+            if getattr(self.img_widget, 'inspection_mode', False):
+                self.img_widget.inspection_mode = False
+                self.img_widget.inspection_results = {}
+        except Exception:
+            pass
         self.update_selected_overlay()
         self.refresh_thumbnail_icons()
         self.refresh_canvas_overlays()
@@ -1042,7 +1268,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.img_widget.update()
 
     def update_erosion_outline(self, row: int = None):
-        # compute erosion outline for the segmentation mask of `row` and store as display QPainterPath
+        # compute erosion outline for the segmentation mask of `row` and store as image-space QPainterPath
         if row is None:
             row = self.img_widget.selected_cell_index
         if row is None or row < 0 or row >= len(self.img_widget.grid_rects):
@@ -1061,9 +1287,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.img_widget.erosion_path = None
                 self.img_widget.update()
                 return
-            dr = self.img_widget.imgrect_to_display(QtCore.QRect(inx, iny, inw, inh))
             path = QtGui.QPainterPath()
-            path.addRect(QtCore.QRectF(dr))
+            path.addRect(QtCore.QRectF(inx, iny, inw, inh))
             self.img_widget.erosion_path = path
             self.img_widget.update()
             return
@@ -1076,7 +1301,8 @@ class MainWindow(QtWidgets.QMainWindow):
             seg_area0 = int((seg_bin > 0).sum())
         except Exception:
             seg_area0 = 0
-        self.log(f'Erosion outline roi_area={seg_area0}, erode_px={erode_px}')
+        # avoid spamming the log on every slider move; uncomment if you need debug output
+        # self.log(f'Erosion outline roi_area={seg_area0}, erode_px={erode_px}')
         # erode by user parameter (in pixels)
         if erode_px > 0:
             try:
@@ -1089,12 +1315,11 @@ class MainWindow(QtWidgets.QMainWindow):
             self.img_widget.erosion_path = None
             self.img_widget.update()
             return
-        # build QPainterPath in display coordinates by mapping unit-local points to absolute image display coords
+        # build QPainterPath in IMAGE coordinates by mapping unit-local points to absolute image coords
         path = QtGui.QPainterPath()
         # unit top-left in image coords
         r, idx = self.img_widget.grid_rects[row]
         ux, uy = int(r[0]), int(r[1])
-        scale = self.img_widget.scale
         for ci, c in enumerate(cnts):
             try:
                 pts = c.reshape(-1, 2)
@@ -1103,12 +1328,12 @@ class MainWindow(QtWidgets.QMainWindow):
             if pts.size == 0:
                 continue
             # first point
-            p0x = int((ux + int(pts[0][0])) * scale)
-            p0y = int((uy + int(pts[0][1])) * scale)
+            p0x = int(ux + int(pts[0][0]))
+            p0y = int(uy + int(pts[0][1]))
             path.moveTo(p0x, p0y)
             for pi in range(1, pts.shape[0]):
-                px = int((ux + int(pts[pi][0])) * scale)
-                py = int((uy + int(pts[pi][1])) * scale)
+                px = int(ux + int(pts[pi][0]))
+                py = int(uy + int(pts[pi][1]))
                 path.lineTo(px, py)
             path.closeSubpath()
         self.img_widget.erosion_path = path
@@ -1118,12 +1343,16 @@ class MainWindow(QtWidgets.QMainWindow):
         # apply zoom multiplier to ImageWidget
         self.img_widget.manual_zoom *= factor
         self.img_widget.updateScale()
+        # keep erosion outline aligned across zoom levels
+        self.update_erosion_outline(self.img_widget.selected_cell_index)
         self.img_widget.update()
 
     def ensure_fit_view(self):
         # reset manual zoom and fit the image to viewport, reset scrollbars to origin
         self.img_widget.manual_zoom = 1.0
         self.img_widget.updateScale()
+        # keep erosion outline aligned after fit-to-view
+        self.update_erosion_outline(self.img_widget.selected_cell_index)
         self.img_widget.update()
         QtWidgets.QApplication.processEvents()
         # reset scrollbars to show top-left (fit)
@@ -1532,6 +1761,12 @@ class MainWindow(QtWidgets.QMainWindow):
         if hasattr(self, 'defect_unit_spin'):
             n = max(0, self.thumb_list.count() - 1)
             self.defect_unit_spin.setRange(0, n)
+            # keep a valid default (0) when units exist
+            if self.thumb_list.count() > 0:
+                try:
+                    self.defect_unit_spin.setValue(min(int(self.defect_unit_spin.value()), n))
+                except Exception:
+                    self.defect_unit_spin.setValue(0)
 
     def export_thumbnails(self):
         if self.thumb_list.count() == 0:
