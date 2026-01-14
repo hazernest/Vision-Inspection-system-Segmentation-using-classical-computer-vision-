@@ -47,8 +47,10 @@ class ImageWidget(QtWidgets.QWidget):
     exclusionDrawn = QtCore.pyqtSignal(object)
     exclusionEditUpdated = QtCore.pyqtSignal(object)
     exclusionEditCommitted = QtCore.pyqtSignal(object)
+    imageFilesDropped = QtCore.pyqtSignal(object)
     def __init__(self, parent=None):
         super().__init__(parent)
+        self.setAcceptDrops(True)
         self.image = None  # QImage
         # positions are stored in image coordinates (not display coordinates)
         self.start_img_pos = None
@@ -91,6 +93,54 @@ class ImageWidget(QtWidgets.QWidget):
         self.inspection_mode = False
         # {grid_idx: bool} where True means defect (X), False means OK (O)
         self.inspection_results = {}
+
+    def dragEnterEvent(self, event: QtGui.QDragEnterEvent):
+        try:
+            md = event.mimeData()
+            if md is None or not md.hasUrls():
+                event.ignore()
+                return
+            paths = []
+            for u in md.urls():
+                try:
+                    if u.isLocalFile():
+                        paths.append(str(u.toLocalFile()))
+                except Exception:
+                    continue
+            ok = any(p.lower().endswith(('.tif', '.tiff')) for p in paths)
+            if ok:
+                event.acceptProposedAction()
+            else:
+                event.ignore()
+        except Exception:
+            event.ignore()
+
+    def dragMoveEvent(self, event: QtGui.QDragMoveEvent):
+        # Same policy as dragEnterEvent
+        self.dragEnterEvent(event)
+
+    def dropEvent(self, event: QtGui.QDropEvent):
+        try:
+            md = event.mimeData()
+            if md is None or not md.hasUrls():
+                event.ignore()
+                return
+            paths = []
+            for u in md.urls():
+                try:
+                    if u.isLocalFile():
+                        p = str(u.toLocalFile())
+                        if p.lower().endswith(('.tif', '.tiff')):
+                            paths.append(p)
+                except Exception:
+                    continue
+            if not paths:
+                event.ignore()
+                return
+            self.imageFilesDropped.emit(paths)
+            event.acceptProposedAction()
+        except Exception:
+            event.ignore()
 
     def load_image(self, path):
         img = QtGui.QImage(path)
@@ -955,6 +1005,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.img_widget.exclusionDrawn.connect(self.on_exclusion_drawn)
         self.img_widget.exclusionEditUpdated.connect(self.on_exclusion_edit_updated)
         self.img_widget.exclusionEditCommitted.connect(self.on_exclusion_edit_committed)
+        self.img_widget.imageFilesDropped.connect(self.on_image_files_dropped)
 
         # switching images from combo
         try:
@@ -1079,6 +1130,35 @@ class MainWindow(QtWidgets.QMainWindow):
                     pass
             self._switch_to_image(first)
             self._ensure_image_registered(first, switch_to=True)
+
+    def on_image_files_dropped(self, paths):
+        # Drag-and-drop import onto the canvas: accept TIFF only.
+        try:
+            paths = list(paths) if isinstance(paths, (list, tuple)) else []
+        except Exception:
+            paths = []
+        paths = [p for p in paths if isinstance(p, str) and p.lower().endswith(('.tif', '.tiff'))]
+        if not paths:
+            return
+
+        # Register all dropped paths, then switch to the first.
+        first = paths[0]
+        for p in paths:
+            self._ensure_image_registered(p, switch_to=False)
+        self._ensure_image_registered(first, switch_to=True)
+
+        # Mirror load_image() behavior.
+        if self._reference_image_path is None:
+            self._reference_image_path = first
+            try:
+                arr = cv2.imread(first, cv2.IMREAD_UNCHANGED)
+                if arr is not None:
+                    self._reference_image_size = (int(arr.shape[1]), int(arr.shape[0]))
+            except Exception:
+                pass
+
+        self.statusBar().showMessage('Loading dropped image...', 2000)
+        self._switch_to_image(first)
 
     def on_image_combo_changed(self, _idx: int):
         # ignore if combo is empty
