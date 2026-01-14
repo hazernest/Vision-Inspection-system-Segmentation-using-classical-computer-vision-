@@ -1,3 +1,4 @@
-PyQt5>=5.12
+PyQt6>=6.5
+PyQt6-Fluent-Widgets>=1.10.0
 opencv-python
 numpy
